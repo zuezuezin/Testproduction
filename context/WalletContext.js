@@ -2,25 +2,27 @@
  * src/context/WalletContext.js
  *
  * Hardened WalletContext:
- * - persisted per-wallet failed-unlock counters (SecureStore) to prevent easy reset by restarting app
- * - binds AAD (walletId + version) into AES-GCM encryption/decryption
- * - awaits random bytes correctly when generating IDs / hardware keys
- * - avoids global localStorage.clear(); uses selective deletion
- * - best-effort zeroing of sensitive variables
+ * - secure RNG validated for private key generation
+ * - addNewWallet does NOT return plaintext; uses temp encrypted blob
+ * - revealTempWalletMnemonic / confirmSaveTempWallet / discardTempWallet APIs
+ * - signMessage / signTransaction helpers to avoid returning private key
+ * - failed-unlock counters persisted; key buffers zeroed
  *
- * TESTING: after integrating, run the QA checklist:
- * - deriveKey timing & length tests on low-end device
- * - AES encrypt/decrypt + tamper detection
- * - hardware-key flows on physical devices (react-native-keychain + native rebuild)
- * - release build tests (Hermes + ProGuard + obfuscation)
+ * NOTE: Verify react-native-simple-crypto, react-native-keychain and expo-secure-store APIs in your env.
  */
 
 import React, { createContext, useState, useEffect, useContext, useCallback, useMemo } from "react";
 import { ethers } from "ethers";
 import { setItemAsync, getItemAsync, deleteItemAsync } from "../utils/secureStore";
-import * as SecureStore from "expo-secure-store";
 import { AppState } from "react-native";
-import { deriveKey, encryptAESGCM, decryptAESGCM } from "../utils/cryptoHelpers";
+import {
+  deriveKey,
+  encryptAESGCM,
+  decryptAESGCM,
+  hexToUint8,
+  zeroBuffer,
+  uint8ToHex,
+} from "../utils/cryptoHelpers";
 import * as ScreenCapture from "expo-screen-capture";
 
 let Keychain = null;
@@ -31,7 +33,7 @@ try {
   Keychain = null;
 }
 
-const WALLET_FAILED_UNLOCKS_PREFIX = "FAILED_UNLOCKS_"; // persisted per wallet
+const WALLET_FAILED_UNLOCKS_PREFIX = "FAILED_UNLOCKS_";
 const WALLET_LAST_FAILED_AT_PREFIX = "LAST_FAILED_AT_";
 
 const WalletContext = createContext();
@@ -44,38 +46,49 @@ export const WalletProvider = ({ children }) => {
   const [hasBackedUp, setHasBackedUp] = useState(false);
   const [isUnlocked, setIsUnlocked] = useState(false);
   const [appState, setAppState] = useState(AppState.currentState);
-
-  // tempWalletData only contains encrypted blob + metadata (no plaintext)
   const [tempWalletData, setTempWalletData] = useState(null);
-
-  // in-memory mirrors of persisted counters for quick access
-  const [failedUnlocksMap, setFailedUnlocksMap] = useState({}); // { walletId: n }
-  const [lastFailedAtMap, setLastFailedAtMap] = useState({}); // { walletId: timestamp }
-
+  const [failedUnlocksMap, setFailedUnlocksMap] = useState({});
+  const [lastFailedAtMap, setLastFailedAtMap] = useState({});
   const RPC_URL = "https://testnet-rpc.monad.xyz";
   const provider = useMemo(() => new ethers.JsonRpcProvider(RPC_URL), []);
-
   const [isDeviceCompromised, setIsDeviceCompromised] = useState(false);
 
-  // Load persisted failed-unlock counters on init
+  // load wallet list and counters
   useEffect(() => {
     (async () => {
       try {
         const wlJson = await getItemAsync("WALLET_LIST");
         const list = wlJson ? JSON.parse(wlJson) : [];
+        const failedMap = {};
+        const atMap = {};
         for (const w of list) {
-          const f = await getItemAsync(`${WALLET_FAILED_UNLOCKS_PREFIX}${w.id}`);
-          const at = await getItemAsync(`${WALLET_LAST_FAILED_AT_PREFIX}${w.id}`);
-          setFailedUnlocksMap((m) => ({ ...m, [w.id]: f ? parseInt(f, 10) : 0 }));
-          setLastFailedAtMap((m) => ({ ...m, [w.id]: at ? parseInt(at, 10) : null }));
+          try {
+            const f = await getItemAsync(`${WALLET_FAILED_UNLOCKS_PREFIX}${w.id}`);
+            const at = await getItemAsync(`${WALLET_LAST_FAILED_AT_PREFIX}${w.id}`);
+            failedMap[w.id] = f ? parseInt(f, 10) : 0;
+            atMap[w.id] = at ? parseInt(at, 10) : null;
+          } catch {
+            failedMap[w.id] = 0;
+            atMap[w.id] = null;
+          }
+        }
+        setFailedUnlocksMap(failedMap);
+        setLastFailedAtMap(atMap);
+        if (list.length) {
+          setWallets(list);
+          const activeWallet = list.find((w) => w.isActive);
+          if (activeWallet) setCurrentWallet(activeWallet);
         }
       } catch {
-        // ignore
+        // minimal logging to avoid leaking details
+        // eslint-disable-next-line no-console
+        console.error("init: failed to load wallet metadata");
+      } finally {
+        setLoading(false);
       }
     })();
   }, []);
 
-  // Jailbreak/root detection (best-effort)
   useEffect(() => {
     (async () => {
       try {
@@ -85,42 +98,37 @@ export const WalletProvider = ({ children }) => {
           setIsDeviceCompromised(true);
         }
       } catch {
-        // ignore if not installed
+        // ignore
       }
     })();
   }, []);
 
-  // Auto-lock timer
   useEffect(() => {
     let timer;
     if (isUnlocked) {
-      timer = setTimeout(() => {
-        lockWallet();
-      }, 2 * 60 * 1000); // 2 minutes
+      timer = setTimeout(() => lockWallet(), 2 * 60 * 1000);
     }
     return () => clearTimeout(timer);
   }, [isUnlocked]);
 
-  // Helpers to persist per-wallet counters
   const persistFailedUnlocks = async (walletId, count) => {
     try {
       await setItemAsync(`${WALLET_FAILED_UNLOCKS_PREFIX}${walletId}`, String(count));
+      setFailedUnlocksMap((m) => ({ ...m, [walletId]: count }));
     } catch {
-      // ignore
+      // do not crash UI
     }
-    setFailedUnlocksMap((m) => ({ ...m, [walletId]: count }));
   };
 
   const persistLastFailedAt = async (walletId, ts) => {
     try {
-      await setItemAsync(`${WALLET_LAST_FAILED_AT_PREFIX}${walletId}`, String(ts || ""));
+      await setItemAsync(`${WALLET_LAST_FAILED_AT_PREFIX}${walletId}`, ts ? String(ts) : "");
+      setLastFailedAtMap((m) => ({ ...m, [walletId]: ts }));
     } catch {
       // ignore
     }
-    setLastFailedAtMap((m) => ({ ...m, [walletId]: ts }));
   };
 
-  // Hardware key helpers
   const enableBiometricKey = async (label = "wallet_hardware_key") => {
     if (!Keychain) throw new Error("Biometric key support requires react-native-keychain");
     try {
@@ -132,24 +140,19 @@ export const WalletProvider = ({ children }) => {
       if (keyBytes && typeof keyBytes.then === "function") keyBytes = await keyBytes;
       const keyHex = RNSimpleCrypto.utils.convertArrayBufferToHex(keyBytes);
 
-      const options = {};
+      const options = { service: label, authenticationPrompt: { title: "Authenticate to use secure wallet key" } };
       try {
         if (Keychain.ACCESSIBLE) options.accessible = Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY;
         if (Keychain.ACCESS_CONTROL) options.accessControl = Keychain.ACCESS_CONTROL.BIOMETRY_ANY;
-        options.service = label;
-        options.authenticationPrompt = { title: "Authenticate to use secure wallet key" };
       } catch {
-        // ignore unavailable constants
+        // ignore if constants not present
       }
 
       await Keychain.setGenericPassword("walletKey", keyHex, options);
 
-      // best-effort: zero keyBytes if possible
       if (keyBytes && keyBytes.fill) keyBytes.fill(0);
       return true;
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn("enableBiometricKey failed");
+    } catch {
       return false;
     }
   };
@@ -161,11 +164,8 @@ export const WalletProvider = ({ children }) => {
         service: label,
         authenticationPrompt: { title: "Authenticate to access wallet key" },
       });
-      if (!creds) return null;
-      return creds.password;
+      return creds ? creds.password : null;
     } catch {
-      // eslint-disable-next-line no-console
-      console.warn("getHardwareKey failed");
       return null;
     }
   };
@@ -180,18 +180,43 @@ export const WalletProvider = ({ children }) => {
     }
   };
 
-  // ----------- Save Wallet -----------
-  // helper to compute AAD from walletId/version
   const makeAadHex = (walletId, version = 1) => {
     const str = `${walletId}|v${version}`;
-    // cheapest utf8->hex
-    return Array.from(new TextEncoder().encode(str)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    const enc = new TextEncoder();
+    const bytes = enc.encode(String(str));
+    return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
   };
 
+  // generate valid secp256k1 private key (retry loop)
+  const generateValidPrivateKey = async () => {
+    const RNSimpleCrypto = require("react-native-simple-crypto").default;
+    const MAX_ATTEMPTS = 8;
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      let rnd = RNSimpleCrypto.utils.randomBytes(32);
+      if (rnd && typeof rnd.then === "function") rnd = await rnd;
+      const pkHex = RNSimpleCrypto.utils.convertArrayBufferToHex(rnd);
+      const pk0x = pkHex.startsWith("0x") ? pkHex : `0x${pkHex}`;
+      try {
+        // ethers will throw for invalid private keys
+        const w = new ethers.Wallet(pk0x);
+        // success
+        return pk0x;
+      } catch {
+        // try again
+      }
+    }
+    throw new Error("Could not generate valid private key");
+  };
+
+  /**
+   * saveWallet(privateKey, phrase, password, options)
+   * - persists encrypted wallet and updates WALLET_LIST
+   * - returns wallet metadata
+   */
   const saveWallet = async (privateKey, phrase, password, options = {}) => {
     const useHardwarePreferred = options.useHardwarePreferred ?? true;
 
-    // generate secure random walletId
+    // secure wallet id
     let randomId = "";
     try {
       const RNSimpleCrypto = require("react-native-simple-crypto").default;
@@ -199,37 +224,36 @@ export const WalletProvider = ({ children }) => {
       if (rnd && typeof rnd.then === "function") rnd = await rnd;
       randomId = RNSimpleCrypto.utils.convertArrayBufferToHex(rnd);
     } catch {
-      randomId = Math.floor(Math.random() * 1e9).toString(16);
+      throw new Error("Secure RNG unavailable");
     }
     const walletId = `wallet_${randomId}_${Date.now()}`;
 
     let encType = "pw";
-    let keyHex = null;
+    let keyBuf = null;
     let saltHex = null;
 
     if (useHardwarePreferred) {
-      const hwKey = await getHardwareKey();
-      if (hwKey) {
+      const hwKeyHex = await getHardwareKey();
+      if (hwKeyHex) {
         encType = "hw";
-        keyHex = hwKey;
+        keyBuf = hexToUint8(hwKeyHex);
       }
     }
 
-    if (!keyHex) {
+    if (!keyBuf) {
       if (!password) throw new Error("Password required to encrypt wallet");
       const derived = await deriveKey(password);
-      keyHex = derived.keyHex;
+      keyBuf = derived.keyBuf;
       saltHex = derived.saltHex;
-      encType = "pw";
     }
 
-    // compute AAD and perform AES-GCM encryption with AAD bound
     const aadHex = makeAadHex(walletId, 1);
-    const { cipherHex: privateKeyCipher, ivHex: privateKeyIv } = await encryptAESGCM(keyHex, privateKey, aadHex);
-    const { cipherHex: mnemonicCipher, ivHex: mnemonicIv } = await encryptAESGCM(keyHex, phrase || "", aadHex);
 
-    // zero key reference best-effort
-    keyHex = null;
+    const { cipherHex: privateKeyCipher, ivHex: privateKeyIv } = await encryptAESGCM(keyBuf, privateKey, aadHex);
+    const { cipherHex: mnemonicCipher, ivHex: mnemonicIv } = await encryptAESGCM(keyBuf, phrase || "", aadHex);
+
+    if (keyBuf) zeroBuffer(keyBuf);
+    keyBuf = null;
 
     const encryptedData = {
       version: 1,
@@ -245,7 +269,6 @@ export const WalletProvider = ({ children }) => {
 
     await setItemAsync(`WALLET_ENC_${walletId}`, JSON.stringify(encryptedData));
 
-    // update wallet list
     const wallet = new ethers.Wallet(privateKey);
     const walletListJson = (await getItemAsync("WALLET_LIST")) || "[]";
     let walletList = JSON.parse(walletListJson);
@@ -267,73 +290,57 @@ export const WalletProvider = ({ children }) => {
     return newWallet;
   };
 
-  // ----------- Load Wallets -----------
-  const loadWallets = useCallback(async () => {
-    setLoading(true);
-    try {
-      const walletListJson = await getItemAsync("WALLET_LIST");
-      const confirmed = await SecureStore.getItemAsync("PHRASE_CONFIRMED");
-      setHasBackedUp(confirmed === "true");
-
-      if (walletListJson) {
-        const walletList = JSON.parse(walletListJson);
-        setWallets(walletList);
-        const activeWallet = walletList.find((w) => w.isActive);
-        if (activeWallet) setCurrentWallet(activeWallet);
-      }
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  // ----------- Create New Wallet (encrypted temp) -----------
+  /**
+   * addNewWallet(walletName, password, options)
+   * - creates wallet securely, stores encrypted temp blob, returns only address metadata
+   */
   const addNewWallet = async (walletName, password, options = {}) => {
     if (!password && !(options.useHardwarePreferred && Keychain)) {
-      throw new Error("Password required to create wallet securely unless hardware key is enabled");
+      throw new Error("Password required to create wallet securely unless hardware key enabled");
     }
-
     if (isDeviceCompromised) {
-      // eslint-disable-next-line no-console
-      console.warn("Device appears compromised (root/jailbreak). Creating wallet is not recommended.");
+      // warn
     }
 
-    const newWalletObj = ethers.Wallet.createRandom();
+    const privateKey = await generateValidPrivateKey();
+    const wallet = new ethers.Wallet(privateKey);
 
-    let keyHex = null;
+    // encryption key
+    let keyBuf = null;
     let saltHex = null;
     let encType = "pw";
 
     if (options.useHardwarePreferred) {
-      const hwKey = await getHardwareKey();
-      if (hwKey) {
-        keyHex = hwKey;
+      const hwKeyHex = await getHardwareKey();
+      if (hwKeyHex) {
+        keyBuf = hexToUint8(hwKeyHex);
         encType = "hw";
       }
     }
 
-    if (!keyHex) {
+    if (!keyBuf) {
       const derived = await deriveKey(password);
-      keyHex = derived.keyHex;
+      keyBuf = derived.keyBuf;
       saltHex = derived.saltHex;
       encType = "pw";
     }
 
-    // temp wallet id to bind AAD
     const tempId = `temp_${Date.now()}`;
     const aadHex = makeAadHex(tempId, 1);
 
     const { cipherHex: privateKeyCipher, ivHex: privateKeyIv } = await encryptAESGCM(
-      keyHex,
-      newWalletObj.privateKey,
+      keyBuf,
+      privateKey,
       aadHex
     );
     const { cipherHex: mnemonicCipher, ivHex: mnemonicIv } = await encryptAESGCM(
-      keyHex,
-      newWalletObj.mnemonic?.phrase || "",
+      keyBuf,
+      wallet.mnemonic?.phrase || "",
       aadHex
     );
 
-    keyHex = null;
+    if (keyBuf) zeroBuffer(keyBuf);
+    keyBuf = null;
 
     const encrypted = {
       version: 1,
@@ -349,11 +356,12 @@ export const WalletProvider = ({ children }) => {
 
     setTempWalletData({
       walletName,
-      address: newWalletObj.address,
+      address: wallet.address,
       encrypted,
       createdAt: Date.now(),
     });
 
+    // auto-clear
     setTimeout(() => {
       setTempWalletData((t) => {
         if (!t) return t;
@@ -362,7 +370,277 @@ export const WalletProvider = ({ children }) => {
       });
     }, 5 * 60 * 1000 + 1000);
 
-    return newWalletObj;
+    // Do NOT return private key or mnemonic; return address metadata only
+    return { address: wallet.address };
+  };
+
+  const revealTempWalletMnemonic = async (password) => {
+    if (!tempWalletData?.encrypted) return null;
+    const enc = tempWalletData.encrypted;
+    let keyBuf = null;
+    try {
+      if (enc.encType === "hw") {
+        const hwHex = await getHardwareKey();
+        if (!hwHex) return null;
+        keyBuf = hexToUint8(hwHex);
+      } else {
+        if (!password) throw new Error("Password required");
+        const derived = await deriveKey(password, enc.saltHex);
+        keyBuf = derived.keyBuf;
+      }
+      const mnemonic = await decryptAESGCM(keyBuf, enc.mnemonicCipher, enc.mnemonicIv, enc.aadHex);
+      return mnemonic;
+    } catch {
+      return null;
+    } finally {
+      if (keyBuf) zeroBuffer(keyBuf);
+      keyBuf = null;
+    }
+  };
+
+  const confirmSaveTempWallet = async (walletName, password, options = {}) => {
+    if (!tempWalletData?.encrypted) throw new Error("No temporary wallet");
+    const enc = tempWalletData.encrypted;
+    let keyBuf = null;
+    try {
+      if (enc.encType === "hw") {
+        const hwHex = await getHardwareKey();
+        if (!hwHex) throw new Error("Hardware key unavailable");
+        keyBuf = hexToUint8(hwHex);
+      } else {
+        if (!password) throw new Error("Password required");
+        const derived = await deriveKey(password, enc.saltHex);
+        keyBuf = derived.keyBuf;
+      }
+
+      const privateKey = await decryptAESGCM(keyBuf, enc.privateKeyCipher, enc.privateKeyIv, enc.aadHex);
+      const mnemonic = await decryptAESGCM(keyBuf, enc.mnemonicCipher, enc.mnemonicIv, enc.aadHex);
+
+      const saved = await saveWallet(privateKey, mnemonic, password, options);
+
+      setTempWalletData(null);
+      return saved;
+    } finally {
+      if (keyBuf) zeroBuffer(keyBuf);
+      keyBuf = null;
+    }
+  };
+
+  const discardTempWallet = async () => {
+    setTempWalletData(null);
+  };
+
+  /**
+   * decryptCurrentWalletPrivateKey(password) - deprecated for UI use.
+   * Prefer signMessage / signTransaction helpers below.
+   */
+  const decryptCurrentWalletPrivateKey = async (password) => {
+    if (!currentWallet) return null;
+    const walletId = currentWallet.id;
+    const encDataJson = await getItemAsync(`WALLET_ENC_${walletId}`);
+    if (!encDataJson) return null;
+    const encData = JSON.parse(encDataJson);
+
+    let keyBuf = null;
+    try {
+      if (encData.encType === "hw") {
+        const hwHex = await getHardwareKey();
+        if (!hwHex) return null;
+        keyBuf = hexToUint8(hwHex);
+      } else {
+        if (!password) throw new Error("Password required");
+        const derived = await deriveKey(password, encData.saltHex);
+        keyBuf = derived.keyBuf;
+      }
+      const privateKey = await decryptAESGCM(keyBuf, encData.privateKeyCipher, encData.privateKeyIv, encData.aadHex);
+      return privateKey;
+    } catch {
+      return null;
+    } finally {
+      if (keyBuf) zeroBuffer(keyBuf);
+      keyBuf = null;
+    }
+  };
+
+  /**
+   * signMessage(payload, passwordOrPrompt)
+   * - decrypts key ephemeral and returns signature; does not return private key
+   */
+  const signMessage = async (message, password = null) => {
+    if (!currentWallet) throw new Error("No active wallet");
+    const walletId = currentWallet.id;
+    const encDataJson = await getItemAsync(`WALLET_ENC_${walletId}`);
+    if (!encDataJson) throw new Error("Encrypted wallet not found");
+    const encData = JSON.parse(encDataJson);
+
+    let keyBuf = null;
+    try {
+      if (encData.encType === "hw") {
+        const hwHex = await getHardwareKey();
+        if (!hwHex) throw new Error("Hardware key unavailable");
+        keyBuf = hexToUint8(hwHex);
+      } else {
+        if (!password) throw new Error("Password required");
+        const derived = await deriveKey(password, encData.saltHex);
+        keyBuf = derived.keyBuf;
+      }
+
+      const privateKey = await decryptAESGCM(keyBuf, encData.privateKeyCipher, encData.privateKeyIv, encData.aadHex);
+      const wallet = new ethers.Wallet(privateKey);
+      const signature = await wallet.signMessage(message);
+
+      // zero any sensitive variables
+      // can't zero JS string privateKey reliably, but we can null refs
+      return signature;
+    } finally {
+      if (keyBuf) zeroBuffer(keyBuf);
+      keyBuf = null;
+    }
+  };
+
+  /**
+   * signTransaction(unsignedTx, password)
+   * - unsignedTx is an ethers Transaction request object
+   * - returns signed tx (serialized)
+   */
+  const signTransaction = async (unsignedTx, password = null) => {
+    if (!currentWallet) throw new Error("No active wallet");
+    const walletId = currentWallet.id;
+    const encDataJson = await getItemAsync(`WALLET_ENC_${walletId}`);
+    if (!encDataJson) throw new Error("Encrypted wallet not found");
+    const encData = JSON.parse(encDataJson);
+
+    let keyBuf = null;
+    try {
+      if (encData.encType === "hw") {
+        const hwHex = await getHardwareKey();
+        if (!hwHex) throw new Error("Hardware key unavailable");
+        keyBuf = hexToUint8(hwHex);
+      } else {
+        if (!password) throw new Error("Password required");
+        const derived = await deriveKey(password, encData.saltHex);
+        keyBuf = derived.keyBuf;
+      }
+
+      const privateKey = await decryptAESGCM(keyBuf, encData.privateKeyCipher, encData.privateKeyIv, encData.aadHex);
+      const wallet = new ethers.Wallet(privateKey);
+      const populated = await wallet.populateTransaction(unsignedTx);
+      const signed = await wallet.signTransaction(populated);
+      return signed;
+    } finally {
+      if (keyBuf) zeroBuffer(keyBuf);
+      keyBuf = null;
+    }
+  };
+
+  const unlockWallet = async (password) => {
+    if (!currentWallet) return false;
+    const walletId = currentWallet.id;
+    const failed = failedUnlocksMap[walletId] || 0;
+    const lastAt = lastFailedAtMap[walletId] || null;
+
+    const MAX_ATTEMPTS = 5;
+    if (failed >= MAX_ATTEMPTS) {
+      const lockSeconds = Math.min(60 * 10, 2 ** (failed - MAX_ATTEMPTS) * 60);
+      const elapsed = lastAt ? Date.now() - lastAt : Infinity;
+      if (elapsed < lockSeconds * 1000) {
+        return false;
+      }
+    }
+
+    const encDataJson = await getItemAsync(`WALLET_ENC_${walletId}`);
+    if (!encDataJson) return false;
+    const encData = JSON.parse(encDataJson);
+
+    let keyBuf = null;
+    try {
+      if (encData.encType === "hw") {
+        const hwHex = await getHardwareKey();
+        if (!hwHex) {
+          await persistFailedUnlocks(walletId, failed + 1);
+          await persistLastFailedAt(walletId, Date.now());
+          return false;
+        }
+        keyBuf = hexToUint8(hwHex);
+      } else {
+        if (!password) return false;
+        const derived = await deriveKey(password, encData.saltHex);
+        keyBuf = derived.keyBuf;
+      }
+    } catch {
+      await persistFailedUnlocks(walletId, failed + 1);
+      await persistLastFailedAt(walletId, Date.now());
+      return false;
+    }
+
+    try {
+      await decryptAESGCM(keyBuf, encData.privateKeyCipher, encData.privateKeyIv, encData.aadHex);
+
+      setIsUnlocked(true);
+      await persistFailedUnlocks(walletId, 0);
+      await persistLastFailedAt(walletId, null);
+
+      try {
+        await ScreenCapture.preventScreenCaptureAsync();
+      } catch {
+        // ignore
+      }
+
+      return true;
+    } catch {
+      await persistFailedUnlocks(walletId, failed + 1);
+      await persistLastFailedAt(walletId, Date.now());
+      return false;
+    } finally {
+      if (keyBuf) zeroBuffer(keyBuf);
+      keyBuf = null;
+    }
+  };
+
+  const lockWallet = async () => {
+    setIsUnlocked(false);
+    try {
+      await ScreenCapture.allowScreenCaptureAsync();
+    } catch {
+      // ignore
+    }
+  };
+
+  const disconnectWallet = async () => {
+    try {
+      for (const wallet of wallets) {
+        await deleteItemAsync(`WALLET_ENC_${wallet.id}`);
+        await deleteItemAsync(`${WALLET_FAILED_UNLOCKS_PREFIX}${wallet.id}`);
+        await deleteItemAsync(`${WALLET_LAST_FAILED_AT_PREFIX}${wallet.id}`);
+      }
+      await deleteItemAsync("WALLET_LIST");
+      await deleteItemAsync("PHRASE_CONFIRMED");
+    } catch {
+      // ignore
+    }
+
+    setWallets([]);
+    setCurrentWallet(null);
+    setMonBalance("0.0");
+    setHasBackedUp(false);
+    setIsUnlocked(false);
+    setTempWalletData(null);
+    setFailedUnlocksMap({});
+    setLastFailedAtMap({});
+
+    if (typeof localStorage !== "undefined") {
+      try {
+        const keysToRemove = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (!k) continue;
+          if (k.startsWith("WALLET_ENC_") || k.startsWith("FAILED_UNLOCKS_") || k === "WALLET_LIST" || k === "PHRASE_CONFIRMED") keysToRemove.push(k);
+        }
+        for (const k of keysToRemove) localStorage.removeItem(k);
+      } catch {
+        // ignore
+      }
+    }
   };
 
   const importWalletFromPrivateKey = async (privateKey, walletName, password, options = {}) => {
@@ -381,156 +659,8 @@ export const WalletProvider = ({ children }) => {
   };
 
   const confirmBackup = async () => {
-    await SecureStore.setItemAsync("PHRASE_CONFIRMED", "true");
+    await setItemAsync("PHRASE_CONFIRMED", "true");
     setHasBackedUp(true);
-  };
-
-  /**
-   * unlockWallet(password?)
-   * - Uses per-wallet persisted failed unlock counters
-   */
-  const unlockWallet = async (password) => {
-    if (!currentWallet) return false;
-    const walletId = currentWallet.id;
-
-    // load persisted counters (in-memory mirrors keep them updated)
-    const failed = failedUnlocksMap[walletId] || 0;
-    const lastAt = lastFailedAtMap[walletId] || null;
-
-    const MAX_ATTEMPTS = 5;
-    if (failed >= MAX_ATTEMPTS) {
-      const lockSeconds = Math.min(60 * 10, 2 ** (failed - MAX_ATTEMPTS) * 60);
-      const elapsed = lastAt ? Date.now() - lastAt : Infinity;
-      if (elapsed < lockSeconds * 1000) {
-        const remaining = Math.ceil((lockSeconds * 1000 - elapsed) / 1000);
-        throw new Error(`Too many attempts. Please wait ${remaining}s before retrying.`);
-      }
-    }
-
-    const encDataJson = await getItemAsync(`WALLET_ENC_${walletId}`);
-    if (!encDataJson) return false;
-    const encData = JSON.parse(encDataJson);
-
-    let keyHex = null;
-    try {
-      if (encData.encType === "hw") {
-        keyHex = await getHardwareKey();
-        if (!keyHex) {
-          await persistFailedUnlocks(walletId, failed + 1);
-          await persistLastFailedAt(walletId, Date.now());
-          return false;
-        }
-      } else {
-        if (!password) {
-          await persistFailedUnlocks(walletId, failed + 1);
-          await persistLastFailedAt(walletId, Date.now());
-          return false;
-        }
-        const derived = await deriveKey(password, encData.saltHex);
-        keyHex = derived.keyHex;
-      }
-    } catch {
-      await persistFailedUnlocks(walletId, failed + 1);
-      await persistLastFailedAt(walletId, Date.now());
-      return false;
-    }
-
-    try {
-      const privateKey = await decryptAESGCM(keyHex, encData.privateKeyCipher, encData.privateKeyIv, encData.aadHex);
-      if (privateKey) {
-        setIsUnlocked(true);
-        await persistFailedUnlocks(walletId, 0);
-        await persistLastFailedAt(walletId, null);
-
-        try {
-          await ScreenCapture.preventScreenCaptureAsync();
-        } catch {
-          // ignore
-        }
-
-        // best-effort clear keyHex
-        keyHex = null;
-        return true;
-      }
-      // wrong key
-      await persistFailedUnlocks(walletId, failed + 1);
-      await persistLastFailedAt(walletId, Date.now());
-      keyHex = null;
-      return false;
-    } catch {
-      await persistFailedUnlocks(walletId, failed + 1);
-      await persistLastFailedAt(walletId, Date.now());
-      keyHex = null;
-      return false;
-    }
-  };
-
-  // decrypt-on-demand helper
-  const decryptCurrentWalletPrivateKey = async (password) => {
-    if (!currentWallet) return null;
-    const walletId = currentWallet.id;
-    const encDataJson = await getItemAsync(`WALLET_ENC_${walletId}`);
-    if (!encDataJson) return null;
-    const encData = JSON.parse(encDataJson);
-
-    let keyHex = null;
-    if (encData.encType === "hw") {
-      keyHex = await getHardwareKey();
-      if (!keyHex) return null;
-    } else {
-      if (!password) throw new Error("Password required to decrypt private key");
-      const derived = await deriveKey(password, encData.saltHex);
-      keyHex = derived.keyHex;
-    }
-
-    try {
-      const privateKey = await decryptAESGCM(keyHex, encData.privateKeyCipher, encData.privateKeyIv, encData.aadHex);
-      return privateKey;
-    } finally {
-      keyHex = null;
-    }
-  };
-
-  const lockWallet = async () => {
-    setIsUnlocked(false);
-    try {
-      await ScreenCapture.allowScreenCaptureAsync();
-    } catch {
-      // ignore
-    }
-  };
-
-  const disconnectWallet = async () => {
-    for (const wallet of wallets) {
-      await deleteItemAsync(`WALLET_ENC_${wallet.id}`);
-      await deleteItemAsync(`${WALLET_FAILED_UNLOCKS_PREFIX}${wallet.id}`);
-      await deleteItemAsync(`${WALLET_LAST_FAILED_AT_PREFIX}${wallet.id}`);
-    }
-    await deleteItemAsync("WALLET_LIST");
-    await SecureStore.deleteItemAsync("PHRASE_CONFIRMED");
-    setWallets([]);
-    setCurrentWallet(null);
-    setMonBalance("0.0");
-    setHasBackedUp(false);
-    setIsUnlocked(false);
-    setTempWalletData(null);
-    setFailedUnlocksMap({});
-    setLastFailedAtMap({});
-
-    // Web cleanup: remove only known keys/prefixes
-    if (typeof localStorage !== "undefined") {
-      try {
-        const keysToRemove = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          if (!k) continue;
-          if (k.startsWith("WALLET_ENC_") || k.startsWith("FAILED_UNLOCKS_") || k === "WALLET_LIST" || k === "PHRASE_CONFIRMED") keysToRemove.push(k);
-        }
-        for (const k of keysToRemove) localStorage.removeItem(k);
-      } catch {
-        // ignore
-      }
-    }
   };
 
   const updateWalletName = async (walletId, newName) => {
@@ -547,7 +677,10 @@ export const WalletProvider = ({ children }) => {
     await deleteItemAsync(`${WALLET_LAST_FAILED_AT_PREFIX}${walletId}`);
     await setItemAsync("WALLET_LIST", JSON.stringify(updatedWallets));
     setWallets(updatedWallets);
-    if (currentWallet?.id === walletId) setCurrentWallet(updatedWallets[0] || null);
+    if (currentWallet?.id === walletId) {
+      const newActiveWallet = updatedWallets.find((w) => w.isActive) || updatedWallets[0] || null;
+      setCurrentWallet(newActiveWallet);
+    }
   };
 
   const getMonBalance = useCallback(
@@ -567,12 +700,11 @@ export const WalletProvider = ({ children }) => {
   );
 
   useEffect(() => {
-    loadWallets();
-  }, [loadWallets]);
-
-  useEffect(() => {
-    if (currentWallet?.address && isUnlocked) getMonBalance(currentWallet.address);
-    else setMonBalance("0.0");
+    if (currentWallet?.address && isUnlocked) {
+      getMonBalance(currentWallet.address);
+    } else {
+      setMonBalance("0.0");
+    }
   }, [currentWallet, getMonBalance, isUnlocked]);
 
   useEffect(() => {
@@ -603,6 +735,9 @@ export const WalletProvider = ({ children }) => {
     hasBackedUp,
     isUnlocked,
     addNewWallet,
+    revealTempWalletMnemonic,
+    confirmSaveTempWallet,
+    discardTempWallet,
     importWalletFromPrivateKey,
     switchWallet,
     confirmBackup,
@@ -617,11 +752,12 @@ export const WalletProvider = ({ children }) => {
     saveWallet,
     validatePasswordStrength,
     isDeviceCompromised,
-    // Hardware key helpers
     enableBiometricKey,
     getHardwareKey,
     removeHardwareKey,
     decryptCurrentWalletPrivateKey,
+    signMessage,
+    signTransaction,
   };
 
   return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>;
