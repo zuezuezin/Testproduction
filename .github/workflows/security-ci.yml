@@ -20,13 +20,13 @@ jobs:
       - name: Install semgrep
         run: pip install semgrep
 
-      - name: Run semgrep (CI rules)
-        run: semgrep --config auto --json --sarif --output semgrep-results.json || true
+      - name: Run semgrep (SARIF output only)
+        run: semgrep --config auto --sarif --output semgrep-results.sarif || true
 
       - name: Upload SARIF to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: semgrep-results.json
+          sarif_file: semgrep-results.sarif
 
   snyk:
     name: Snyk dependency scan (only same-repo PRs / pushes)
