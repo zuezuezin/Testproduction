@@ -5,6 +5,10 @@ on:
   push:
     branches: ["main"]
 
+permissions:
+  contents: read
+  security-events: write   # SARIF upload လုပ်ဖို့လို
+
 jobs:
   semgrep:
     name: Semgrep scan (safe for forks)
@@ -24,6 +28,7 @@ jobs:
         run: semgrep --config auto --sarif --output semgrep-results.sarif || true
 
       - name: Upload SARIF to GitHub Security tab
+        if: github.repository == github.event.pull_request.head.repo.full_name || github.event_name == 'push'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep-results.sarif
@@ -50,7 +55,7 @@ jobs:
         run: npm ci
 
       - name: Snyk setup (install CLI)
-        uses: snyk/actions/setup@v3
+        uses: snyk/actions/setup@v2
         with:
           version: latest
 
@@ -68,4 +73,3 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: snyk monitor --all-projects
-
