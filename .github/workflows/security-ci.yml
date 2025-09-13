@@ -55,9 +55,9 @@ jobs:
         run: npm ci
 
       - name: Snyk setup (install CLI)
-        uses: snyk/actions/setup@v2
+        uses: snyk/actions/setup@master
         with:
-          version: latest
+          snyk-version: latest
 
       - name: Authenticate Snyk
         env:
