@@ -1,0 +1,23 @@
+rules:
+  - id: no-hardcoded-private-keys
+    patterns:
+      - pattern: "PRIVATE_KEY"
+      - pattern-either:
+          - pattern: /0x[0-9a-fA-F]{64}/
+          - pattern: /[0-9A-Fa-f]{64}/
+    message: "Potential hardcoded private key / hex secret. Don't commit secrets."
+    languages: [javascript, typescript]
+    severity: ERROR
+
+  - id: avoid-localStorage-secrets
+    pattern: |
+      localStorage.setItem($KEY, $VALUE)
+    message: "Avoid storing sensitive wallet data in localStorage."
+    languages: [javascript, typescript]
+    severity: WARNING
+
+  - id: avoid-eval
+    pattern: eval(...)
+    message: "Avoid using eval()."
+    languages: [javascript, typescript]
+    severity: ERROR
