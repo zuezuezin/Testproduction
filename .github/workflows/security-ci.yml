@@ -1,1 +1,71 @@
+name: Security CI (Semgrep + Snyk)
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+jobs:
+  semgrep:
+    name: Semgrep scan (safe for forks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
+
+      - name: Install semgrep
+        run: pip install semgrep
+
+      - name: Run semgrep (SARIF output only)
+        run: semgrep --config auto --sarif --output semgrep-results.sarif || true
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-results.sarif
+
+  snyk:
+    name: Snyk dependency scan (only same-repo PRs / pushes)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Snyk setup (install CLI)
+        uses: snyk/actions/setup@v3
+        with:
+          version: latest
+
+      - name: Authenticate Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk auth $SNYK_TOKEN
+
+      - name: Run snyk test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk test --all-projects --severity-threshold=high
+
+      - name: Snyk monitor (upload snapshot to dashboard)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk monitor --all-projects
 
